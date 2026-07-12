@@ -1,9 +1,9 @@
 # pantheon-ical
 
 [![tests](https://github.com/Igfray/pantheon-ical/actions/workflows/ci.yml/badge.svg)](https://github.com/Igfray/pantheon-ical/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/pantheon-ical.svg)](https://pypi.org/project/pantheon-ical/)
-[![Python](https://img.shields.io/pypi/pyversions/pantheon-ical.svg)](https://pypi.org/project/pantheon-ical/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/pantheon-ical)](https://pypi.org/project/pantheon-ical/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://pypi.org/project/pantheon-ical/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 **Round-trip iCal (RFC 5545) read + write for booking / availability calendars — in under 200 lines.**
 
