@@ -1,5 +1,10 @@
 # pantheon-ical
 
+[![tests](https://github.com/Igfray/pantheon-ical/actions/workflows/ci.yml/badge.svg)](https://github.com/Igfray/pantheon-ical/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pantheon-ical.svg)](https://pypi.org/project/pantheon-ical/)
+[![Python](https://img.shields.io/pypi/pyversions/pantheon-ical.svg)](https://pypi.org/project/pantheon-ical/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 **Round-trip iCal (RFC 5545) read + write for booking / availability calendars — in under 200 lines.**
 
 > The guarantee: import busy dates from the systems that speak iCal (Airbnb, Booking.com, Google Calendar, Vrbo, …), **and** export your own busy dates back as a feed they import — with the same half-open date model on both sides, so a block on any channel propagates to the others without double-booking.
