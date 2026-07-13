@@ -30,10 +30,33 @@ holiday-let / appointment businesses it hosts.
 """
 from __future__ import annotations
 
+import logging
+import math
 import re
 from datetime import UTC, date, datetime, timedelta
 
+log = logging.getLogger("pantheon_ical")
+
 _DT_RE = re.compile(r"^(DTSTART|DTEND)(?:;[^:]*)?:(.+)$", re.IGNORECASE)
+_DUR_RE = re.compile(r"^DURATION(?:;[^:]*)?:(.+)$", re.IGNORECASE)
+# RFC 5545 §3.3.6 duration: [+-]P(nW | nD? (T nH? nM? nS?)?)
+_DURATION_VALUE_RE = re.compile(
+    r"^(?P<sign>[+-])?P(?:(?P<w>\d+)W)?(?:(?P<d>\d+)D)?(?:T(?:(?P<h>\d+)H)?(?:(?P<m>\d+)M)?(?:(?P<s>\d+)S)?)?$",
+    re.IGNORECASE)
+
+
+def _parse_duration(value: str) -> timedelta | None:
+    """An RFC 5545 DURATION value (`P4D`, `P1W`, `P1DT12H`) → timedelta, or None if unparseable / non-positive.
+    Used when a VEVENT carries DTSTART + DURATION instead of DTEND (which OTA feeds emit) — without this the event
+    would silently collapse to a single night, UNDER-blocking the calendar (the double-booking this guards against)."""
+    m = _DURATION_VALUE_RE.match((value or "").strip())
+    if not m or not any(m.group(g) for g in ("w", "d", "h", "m", "s")):
+        return None
+    total = timedelta(weeks=int(m["w"] or 0), days=int(m["d"] or 0), hours=int(m["h"] or 0),
+                      minutes=int(m["m"] or 0), seconds=int(m["s"] or 0))
+    if total <= timedelta(0):                              # zero / negative duration is not a bookable span
+        return None
+    return -total if m["sign"] == "-" else total
 
 
 def build_ical(ranges: list[tuple[date, date]], *, uid_ns: str = "", cal_name: str = "Availability",
@@ -76,22 +99,27 @@ def _parse_date(value: str) -> date | None:
 
 
 def parse_ical(text: str, *, max_events: int = 730) -> list[tuple[date, date]]:
-    """Parse a feed into half-open [start, end) blocked DATE ranges from its VEVENTs. A VEVENT with no DTEND (or
-    a non-positive range) becomes a single night. RRULE recurrence is expanded (bounded). Caps at max_events."""
+    """Parse a feed into half-open [start, end) blocked DATE ranges from its VEVENTs. End is taken from DTEND, else
+    DTSTART+DURATION (OTAs emit this), else a single night. RRULE recurrence is expanded (bounded). Caps at
+    max_events."""
     text = re.sub(r"\r?\n[ \t]", "", text or "")            # unfold continuation lines (RFC 5545 §3.1)
     ranges: list[tuple[date, date]] = []
     in_event = False
     start: date | None = None
     end: date | None = None
+    duration: timedelta | None = None
     rrule: str | None = None
     exdates: list[str] = []
     for raw in text.splitlines():
         line = raw.strip()
         upper = line.upper()
         if upper == "BEGIN:VEVENT":
-            in_event, start, end, rrule, exdates = True, None, None, None, []
+            in_event, start, end, duration, rrule, exdates = True, None, None, None, None, []
         elif upper == "END:VEVENT":
             if in_event and start is not None:
+                # end precedence: an explicit DTEND, else DTSTART+DURATION (OTAs emit this), else a single night.
+                if end is None and duration is not None:
+                    end = start + timedelta(days=max(1, math.ceil(duration.total_seconds() / 86400)))
                 e = end if (end is not None and end > start) else start + timedelta(days=1)
                 for os_, oe_ in _expand(start, e, rrule, exdates):
                     ranges.append((os_, oe_))
@@ -109,6 +137,10 @@ def parse_ical(text: str, *, max_events: int = 730) -> list[tuple[date, date]]:
                         start = d
                     else:
                         end = d
+            elif upper.startswith("DURATION"):
+                md = _DUR_RE.match(line)
+                if md:
+                    duration = _parse_duration(md.group(1))
             elif upper.startswith("RRULE:"):
                 rrule = line
             elif upper.startswith("EXDATE"):
@@ -161,6 +193,12 @@ def _expand(start, end, rrule_line: str | None, exdate_lines: list[str],
         return [(occ.date(), (occ + dur).date()) if is_date else (occ, occ + dur) for occ in window]
         # empty = no current/future occurrences → block nothing (an expired/EXDATE'd rule must not re-block its master)
     except Exception:                                       # noqa: BLE001 — safe single-occurrence fallback
+        # The fallback is safe for a rule we don't model (it OVER-blocks via the master). But it ALSO catches a
+        # broken/missing dateutil or a malformed rule — and there it UNDER-blocks a recurring booking (the
+        # double-book this guards against). Log it LOUDLY so a broken expander is visible, not silent. [audit]
+        log.warning("RRULE expansion failed for %r — falling back to the single master occurrence; a recurring "
+                    "block may under-block. Check python-dateutil is installed and the rule is valid.",
+                    rrule_line, exc_info=True)
         return [(start, end)]
 
 

@@ -57,3 +57,27 @@ def test_slots_keep_datetimes_and_positive_span():
     slots = parse_ical_slots(feed)
     assert len(slots) == 1
     assert slots[0][0].hour == 9 and slots[0][1].hour == 10
+
+
+def test_dtstart_plus_duration_blocks_the_full_span():
+    # OTAs emit DTSTART + DURATION instead of DTEND; without support this silently collapsed to one night.
+    from pantheon_ical import parse_ical
+    assert parse_ical("BEGIN:VEVENT\nDTSTART;VALUE=DATE:20260701\nDURATION:P4D\nEND:VEVENT") == \
+        [(date(2026, 7, 1), date(2026, 7, 5))]                                  # 4 nights, not 1
+    assert parse_ical("BEGIN:VEVENT\nDTSTART;VALUE=DATE:20260701\nDURATION:P1W\nEND:VEVENT") == \
+        [(date(2026, 7, 1), date(2026, 7, 8))]                                  # a week
+    # an explicit DTEND still wins over a (contradictory) DURATION
+    assert parse_ical("BEGIN:VEVENT\nDTSTART;VALUE=DATE:20260701\nDTEND;VALUE=DATE:20260703\n"
+                      "DURATION:P9D\nEND:VEVENT") == [(date(2026, 7, 1), date(2026, 7, 3))]
+
+
+def test_broken_expander_logs_instead_of_silently_underblocking(caplog):
+    # if dateutil's expansion raises (broken/missing lib, malformed rule), the safe fallback fires — but it must
+    # be LOUD, because in that direction the fallback under-blocks a recurring booking (a double-book).
+    import logging
+
+    import pantheon_ical
+    with caplog.at_level(logging.WARNING, logger="pantheon_ical"):
+        out = pantheon_ical._expand(date(2026, 7, 1), date(2026, 7, 2), "RRULE:FREQ=NONSENSE;X=Y", [])
+    assert out == [(date(2026, 7, 1), date(2026, 7, 2))]                        # fell back to the master
+    assert any("expansion failed" in r.message for r in caplog.records)        # …and said so

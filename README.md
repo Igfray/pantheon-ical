@@ -44,6 +44,12 @@ pip install pantheon-ical      # or copy the single pantheon_ical.py file
 
 Depends only on `python-dateutil` (for RRULE expansion).
 
+
+## Changelog
+
+- **0.1.1** — **DTSTART+DURATION support** (OTA feeds emit it) so a durational booking blocks its full span, not a single night (the exact silent under-block → double-book this guards against); and the RRULE expansion fallback now **logs a warning** instead of failing silently, so a broken/missing dateutil is visible rather than quietly under-blocking recurring dates.
+- **0.1.0** — initial release.
+
 ## License
 
 Apache-2.0. See `LICENSE`.
