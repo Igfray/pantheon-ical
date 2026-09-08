@@ -98,7 +98,20 @@ def _parse_date(value: str) -> date | None:
         return None
 
 
-def parse_ical(text: str, *, max_events: int = 730) -> list[tuple[date, date]]:
+class ICalTooLarge(ValueError):
+    """A calendar held more busy periods than the caller allowed.
+
+    Raised instead of returning a truncated list. A partial busy-list is indistinguishable from a
+    complete one, and the error runs the wrong way: unseen busy periods read as FREE, so the
+    caller offers a date the owner has already sold. Pass `on_overflow="truncate"` to opt back
+    into the old behaviour as an explicit decision.
+
+    Subclasses ValueError so existing handlers keep working.
+    """
+
+
+def parse_ical(text: str, *, max_events: int = 730,
+               on_overflow: str = "raise") -> list[tuple[date, date]]:
     """Parse a feed into half-open [start, end) blocked DATE ranges from its VEVENTs. End is taken from DTEND, else
     DTSTART+DURATION (OTAs emit this), else a single night. RRULE recurrence is expanded (bounded). Caps at
     max_events."""
@@ -145,6 +158,10 @@ def parse_ical(text: str, *, max_events: int = 730) -> list[tuple[date, date]]:
                 rrule = line
             elif upper.startswith("EXDATE"):
                 exdates.append(line)
+    if len(ranges) >= max_events and on_overflow != "truncate":
+        raise ICalTooLarge(
+            f"calendar holds at least {len(ranges)} busy periods, over the {max_events} limit; "
+            "refusing rather than returning a partial busy-list (unseen busy periods read as free)")
     return ranges
 
 
@@ -202,7 +219,8 @@ def _expand(start, end, rrule_line: str | None, exdate_lines: list[str],
         return [(start, end)]
 
 
-def parse_ical_slots(text: str, *, max_events: int = 2000) -> list[tuple[datetime, datetime]]:
+def parse_ical_slots(text: str, *, max_events: int = 2000,
+                     on_overflow: str = "raise") -> list[tuple[datetime, datetime]]:
     """Parse a feed into [start, end) DATETIME slots from its VEVENTs (for appointment/class calendars). Each
     VEVENT needs both DTSTART and DTEND with a positive span; events with no usable end are skipped."""
     text = re.sub(r"\r?\n[ \t]", "", text or "")
@@ -243,4 +261,8 @@ def parse_ical_slots(text: str, *, max_events: int = 2000) -> list[tuple[datetim
                 rrule = line
             elif upper.startswith("EXDATE"):
                 exdates.append(line)
+    if len(slots) >= max_events and on_overflow != "truncate":
+        raise ICalTooLarge(
+            f"calendar holds at least {len(slots)} busy slots, over the {max_events} limit; "
+            "refusing rather than returning a partial busy-list (unseen busy slots read as free)")
     return slots

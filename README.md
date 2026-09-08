@@ -47,6 +47,9 @@ Depends only on `python-dateutil` (for RRULE expansion).
 
 ## Changelog
 
+- **0.2.0** — **an oversized calendar now raises `ICalTooLarge` instead of silently returning a truncated busy-list.** `parse_ical` capped at `max_events=730` and returned a plain list, so a caller could not tell "this calendar has 700 busy periods" from "this calendar had 5,000 and you are seeing 730". For an availability feed the error runs the wrong way: a busy period that was never parsed reads as FREE, so the caller offers a date the owner has already sold. `ICalTooLarge` subclasses `ValueError`; pass `on_overflow="truncate"` to opt back into a partial list as an explicit decision. The work bound is unchanged either way.
+
+
 - **0.1.1** — **DTSTART+DURATION support** (OTA feeds emit it) so a durational booking blocks its full span, not a single night (the exact silent under-block → double-book this guards against); and the RRULE expansion fallback now **logs a warning** instead of failing silently, so a broken/missing dateutil is visible rather than quietly under-blocking recurring dates.
 - **0.1.0** — initial release.
 

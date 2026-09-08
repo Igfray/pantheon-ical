@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import date
 
-from pantheon_ical import build_ical, parse_ical, parse_ical_slots
+import pytest
+
+from pantheon_ical import ICalTooLarge, build_ical, parse_ical, parse_ical_slots
 
 
 def test_roundtrips_through_parse():
@@ -81,3 +83,64 @@ def test_broken_expander_logs_instead_of_silently_underblocking(caplog):
         out = pantheon_ical._expand(date(2026, 7, 1), date(2026, 7, 2), "RRULE:FREQ=NONSENSE;X=Y", [])
     assert out == [(date(2026, 7, 1), date(2026, 7, 2))]                        # fell back to the master
     assert any("expansion failed" in r.message for r in caplog.records)        # …and said so
+
+
+# ── truncation must be visible, 2026-09-08 ────────────────────────────────────────────────────────
+# Same defect class an external reviewer found in the sibling components: a bound that silently
+# drops data. `parse_ical(max_events=730)` returns a plain list, so a caller cannot distinguish
+# "this calendar has 700 busy periods" from "this calendar had 5,000 and you are seeing 730".
+#
+# For an availability feed that is not a cosmetic difference. Unseen busy periods read as FREE, so
+# the failure mode is a double-booking: the system confidently offers a date the owner has sold.
+# A fetch failure already aborts the whole sync (calendar_feeds.py) -- silent truncation is a
+# quieter version of the same event and should be at least as loud.
+
+class TestTruncationIsVisibleToTheCaller:
+
+    @staticmethod
+    def _cal(n: int) -> str:
+        ev = "".join(
+            f"BEGIN:VEVENT\r\nUID:u{i}\r\nDTSTART;VALUE=DATE:2026{(i % 12) + 1:02d}{(i % 28) + 1:02d}\r\n"
+            f"DTEND;VALUE=DATE:2026{(i % 12) + 1:02d}{(i % 28) + 2:02d}\r\nEND:VEVENT\r\n"
+            for i in range(n))
+        return "BEGIN:VCALENDAR\r\n" + ev + "END:VCALENDAR\r\n"
+
+    def test_a_calendar_within_the_cap_parses_normally(self):
+        out = parse_ical(self._cal(50))
+        assert out and len(out) <= 50
+
+    def test_a_calendar_over_the_cap_raises_rather_than_silently_dropping(self):
+        """Refuse, don't truncate: a partial busy-list is indistinguishable from a complete one,
+        and the wrong direction of error is 'we think you're free'."""
+        with pytest.raises(ICalTooLarge) as exc:
+            parse_ical(self._cal(3000), max_events=100)
+        assert "100" in str(exc.value)
+
+    def test_the_exception_is_a_valueerror_for_existing_handlers(self):
+        assert issubclass(ICalTooLarge, ValueError)
+
+    def test_a_caller_that_prefers_a_partial_answer_must_ask_for_it(self):
+        """The unsafe behaviour is still available, but only as an explicit decision."""
+        out = parse_ical(self._cal(3000), max_events=100, on_overflow="truncate")
+        assert len(out) == 100
+
+    def test_slots_parsing_has_the_same_contract(self):
+        big = "BEGIN:VCALENDAR\r\n" + "".join(
+            f"BEGIN:VEVENT\r\nUID:s{i}\r\nDTSTART:2026010{(i % 9) + 1}T090000Z\r\n"
+            f"DTEND:2026010{(i % 9) + 1}T100000Z\r\nEND:VEVENT\r\n" for i in range(3000)
+        ) + "END:VCALENDAR\r\n"
+        with pytest.raises(ICalTooLarge):
+            parse_ical_slots(big, max_events=100)
+
+    def test_the_cap_still_bounds_work_when_truncation_is_requested(self):
+        """The DoS bound must survive the escape hatch -- 'truncate' still stops at the cap."""
+        out = parse_ical(self._cal(20000), max_events=50, on_overflow="truncate")
+        assert len(out) == 50
+
+    def test_an_rrule_that_expands_past_the_cap_is_also_refused(self):
+        """An 'every day forever' rule is the cheap way to overflow a calendar."""
+        rec = ("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r1\r\n"
+               "DTSTART;VALUE=DATE:20260101\r\nDTEND;VALUE=DATE:20260102\r\n"
+               "RRULE:FREQ=DAILY;COUNT=400\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+        with pytest.raises(ICalTooLarge):
+            parse_ical(rec, max_events=10)
