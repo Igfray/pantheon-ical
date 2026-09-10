@@ -2,7 +2,7 @@
 """Round-trip + edge cases for the iCal read/write library."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -144,3 +144,86 @@ class TestTruncationIsVisibleToTheCaller:
                "RRULE:FREQ=DAILY;COUNT=400\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
         with pytest.raises(ICalTooLarge):
             parse_ical(rec, max_events=10)
+
+
+# ── recurrence overflow, and the boundary that rejected its own limit [2026-09-10] ───────────────
+# Astra, third review. The v0.2.0 fix made an oversized calendar refuse rather than truncate --
+# but only counted EVENTS. A single VEVENT carrying RRULE:FREQ=HOURLY;COUNT=500 expands inside
+# _expand(), which slices to max_occ=400 and returns. The outer check counts what came back, so
+# it cannot see the 100 occurrences that were dropped: the overflow test sits OUTSIDE the function
+# that discards the data.
+#
+# For an availability feed, a dropped busy period reads as FREE. This is the double-booking the
+# whole v0.2.0 change existed to prevent, arriving by the one path that change did not cover.
+#
+# _expand's own comments reason carefully about under-blocking in the fallback path, then slice
+# silently two lines above. The care and the defect are in the same function.
+
+def _hourly_calendar(count: int) -> str:
+    """One VEVENT, `count` half-hour occurrences, starting tomorrow — all inside the horizon."""
+    start = datetime.now(timezone.utc) + timedelta(days=1)
+    return (
+        "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:rec-1\n"
+        f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}\n"
+        f"DTEND:{(start + timedelta(minutes=30)).strftime('%Y%m%dT%H%M%SZ')}\n"
+        f"RRULE:FREQ=HOURLY;COUNT={count}\n"
+        "END:VEVENT\nEND:VCALENDAR\n"
+    )
+
+
+class TestARecurringEventCannotBeSilentlyClipped:
+
+    def test_recurrence_overflow_raises_instead_of_returning_a_short_list(self):
+        """Astra's reproduction: 500 requested, 400 returned, no exception."""
+        with pytest.raises(ICalTooLarge):
+            parse_ical_slots(_hourly_calendar(500), max_events=5000)
+
+    def test_the_message_names_recurrence_so_the_cause_is_findable(self):
+        with pytest.raises(ICalTooLarge) as e:
+            parse_ical_slots(_hourly_calendar(500), max_events=5000)
+        assert "recurr" in str(e.value).lower(), (
+            "an operator reading this needs to know it was ONE rule that overflowed, "
+            f"not a calendar with thousands of events: {e.value}")
+
+    def test_a_recurrence_inside_the_cap_is_returned_whole(self):
+        # The guard must not refuse legitimate recurring events -- the failure mode that would
+        # replace a double-booking with a feed that never syncs at all.
+        out = parse_ical_slots(_hourly_calendar(50), max_events=5000)
+        assert len(out) == 50, f"a 50-occurrence rule must survive intact, got {len(out)}"
+
+    def test_truncate_still_bounds_the_work_when_explicitly_asked(self):
+        out = parse_ical_slots(_hourly_calendar(500), max_events=5000, on_overflow="truncate")
+        assert 0 < len(out) <= 500
+
+    def test_the_same_hole_in_parse_ical(self):
+        # sibling path: the busy-period parser expands the same way
+        with pytest.raises(ICalTooLarge):
+            parse_ical(_hourly_calendar(500), max_events=5000)
+
+
+class TestTheLimitIsTheLimitNotOneBelowIt:
+    """`>=` rejected a calendar sitting exactly ON its advertised limit.
+
+    Cosmetic-looking, but it means the documented number is a lie by one, and a caller who sizes
+    max_events to their real feed gets a refusal on a calendar that fits.
+    """
+
+    def _one_event(self) -> str:
+        start = datetime.now(timezone.utc) + timedelta(days=1)
+        return ("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:single\n"
+                f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}\n"
+                f"DTEND:{(start + timedelta(minutes=30)).strftime('%Y%m%dT%H%M%SZ')}\n"
+                "END:VEVENT\nEND:VCALENDAR\n")
+
+    def test_exactly_at_the_limit_is_accepted_slots(self):
+        out = parse_ical_slots(self._one_event(), max_events=1)
+        assert len(out) == 1
+
+    def test_exactly_at_the_limit_is_accepted_ranges(self):
+        out = parse_ical(self._one_event(), max_events=1)
+        assert len(out) == 1
+
+    def test_one_over_the_limit_still_refuses(self):
+        # the off-by-one fix must not become "no limit at all"
+        with pytest.raises(ICalTooLarge):
+            parse_ical_slots(_hourly_calendar(3), max_events=2)

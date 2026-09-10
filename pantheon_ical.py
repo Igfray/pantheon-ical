@@ -134,12 +134,19 @@ def parse_ical(text: str, *, max_events: int = 730,
                 if end is None and duration is not None:
                     end = start + timedelta(days=max(1, math.ceil(duration.total_seconds() / 86400)))
                 e = end if (end is not None and end > start) else start + timedelta(days=1)
-                for os_, oe_ in _expand(start, e, rrule, exdates):
+                try:
+                    _occ = _expand(start, e, rrule, exdates)
+                except _RecurrenceOverflow as exc:
+                    if on_overflow == "truncate":
+                        _occ = _expand(start, e, rrule, exdates, max_occ=10 ** 9)[:max_events]
+                    else:
+                        raise _public_overflow(exc, "busy-period") from None
+                for os_, oe_ in _occ:
                     ranges.append((os_, oe_))
-                    if len(ranges) >= max_events:
+                    if len(ranges) > max_events:
                         break
             in_event = False
-            if len(ranges) >= max_events:
+            if len(ranges) > max_events:
                 break
         elif in_event:
             m = _DT_RE.match(line)
@@ -158,11 +165,11 @@ def parse_ical(text: str, *, max_events: int = 730,
                 rrule = line
             elif upper.startswith("EXDATE"):
                 exdates.append(line)
-    if len(ranges) >= max_events and on_overflow != "truncate":
+    if len(ranges) > max_events and on_overflow != "truncate":
         raise ICalTooLarge(
             f"calendar holds at least {len(ranges)} busy periods, over the {max_events} limit; "
             "refusing rather than returning a partial busy-list (unseen busy periods read as free)")
-    return ranges
+    return ranges[:max_events]
 
 
 def _parse_datetime(value: str, tzid: str | None = None) -> datetime | None:
@@ -186,6 +193,30 @@ def _parse_datetime(value: str, tzid: str | None = None) -> datetime | None:
     return dt
 
 
+class _RecurrenceOverflow(Exception):
+    """Internal: one RRULE expanded past its occurrence cap.
+
+    Deliberately NOT ICalTooLarge — the public functions catch this and re-raise with a message
+    naming the rule, so an operator sees "one recurring event" rather than "a huge calendar".
+    """
+
+    def __init__(self, rule: str | None, found: int, cap: int) -> None:
+        self.rule, self.found, self.cap = rule, found, cap
+        super().__init__(f"recurring rule {rule!r} expands to at least {found} occurrences, "
+                         f"over the {cap} per-rule limit")
+
+
+def _public_overflow(exc: "_RecurrenceOverflow", noun: str) -> "ICalTooLarge":
+    """Internal recurrence overflow → the public exception, naming the rule.
+
+    An operator seeing "calendar holds at least N busy periods" would go looking for a huge
+    calendar. The truth is one recurring rule, and the message should say so.
+    """
+    return ICalTooLarge(
+        f"a recurring event overflowed: {exc.args[0]}; refusing rather than returning a partial "
+        f"{noun} list (unseen busy periods read as free)")
+
+
 def _expand(start, end, rrule_line: str | None, exdate_lines: list[str],
             *, max_occ: int = 400, horizon_days: int = 400) -> list:
     """Expand a recurring VEVENT (RRULE) into concrete (start, end) occurrences via python-dateutil — bounded to
@@ -206,9 +237,18 @@ def _expand(start, end, rrule_line: str | None, exdate_lines: list[str],
         # Anchor to NOW, not DTSTART: an established recurrence has a DTSTART years in the past, so a
         # DTSTART-anchored horizon would expand only historical occurrences and leave live dates unblocked.
         now = datetime.now(s_dt.tzinfo) if s_dt.tzinfo else datetime.now()   # noqa: DTZ005
-        window = rule.between(now - timedelta(days=2), now + timedelta(days=horizon_days), inc=True)[:max_occ]
+        window = rule.between(now - timedelta(days=2), now + timedelta(days=horizon_days), inc=True)
+        # Take ONE more than the cap so excess is DETECTED rather than sliced away. The old code
+        # did `[:max_occ]` here and the overflow check lived in the caller, counting what came
+        # back — so it could never see what this line discarded. A dropped busy period reads as
+        # FREE to an availability caller, which is the double-booking the overflow check exists
+        # to prevent, arriving by the one path that check did not cover. [astra 3, 2026-09-10]
+        if len(window) > max_occ:
+            raise _RecurrenceOverflow(rrule_line, len(window), max_occ)
         return [(occ.date(), (occ + dur).date()) if is_date else (occ, occ + dur) for occ in window]
         # empty = no current/future occurrences → block nothing (an expired/EXDATE'd rule must not re-block its master)
+    except _RecurrenceOverflow:
+        raise                                               # never swallowed by the fallback below
     except Exception:                                       # noqa: BLE001 — safe single-occurrence fallback
         # The fallback is safe for a rule we don't model (it OVER-blocks via the master). But it ALSO catches a
         # broken/missing dateutil or a malformed rule — and there it UNDER-blocks a recurring booking (the
@@ -238,14 +278,27 @@ def parse_ical_slots(text: str, *, max_events: int = 2000,
         elif upper == "END:VEVENT":
             try:
                 if in_event and start is not None and end is not None and end > start:
-                    for os_, oe_ in _expand(start, end, rrule, exdates):
+                    try:
+                        _occ = _expand(start, end, rrule, exdates)
+                    except _RecurrenceOverflow as exc:
+                        if on_overflow == "truncate":
+                            _occ = _expand(start, end, rrule, exdates, max_occ=10 ** 9)[:max_events]
+                        else:
+                            raise _public_overflow(exc, "slot") from None
+                    for os_, oe_ in _occ:
                         slots.append((os_, oe_))
-                        if len(slots) >= max_events:
+                        if len(slots) > max_events:
                             break
+            except ICalTooLarge:
+                # ICalTooLarge IS a ValueError subclass (deliberately — v0.2.0 callers catch
+                # ValueError). The skip-this-event handler below would therefore SWALLOW an
+                # overflow refusal and drop the event silently: the exact under-block the
+                # refusal exists to prevent. Re-raise before it can. [astra 3, 2026-09-10]
+                raise
             except (TypeError, ValueError):                 # mixed tz-aware/naive DTSTART vs DTEND → skip the event
                 pass
             in_event = False
-            if len(slots) >= max_events:
+            if len(slots) > max_events:
                 break
         elif in_event:
             m = _DT_RE.match(line)
@@ -261,8 +314,8 @@ def parse_ical_slots(text: str, *, max_events: int = 2000,
                 rrule = line
             elif upper.startswith("EXDATE"):
                 exdates.append(line)
-    if len(slots) >= max_events and on_overflow != "truncate":
+    if len(slots) > max_events and on_overflow != "truncate":
         raise ICalTooLarge(
             f"calendar holds at least {len(slots)} busy slots, over the {max_events} limit; "
             "refusing rather than returning a partial busy-list (unseen busy slots read as free)")
-    return slots
+    return slots[:max_events]
