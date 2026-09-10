@@ -138,7 +138,7 @@ def parse_ical(text: str, *, max_events: int = 730,
                     _occ = _expand(start, e, rrule, exdates)
                 except _RecurrenceOverflow as exc:
                     if on_overflow == "truncate":
-                        _occ = _expand(start, e, rrule, exdates, max_occ=10 ** 9)[:max_events]
+                        _occ = _expand(start, e, rrule, exdates, max_occ=max_events, truncate=True)
                     else:
                         raise _public_overflow(exc, "busy-period") from None
                 for os_, oe_ in _occ:
@@ -218,7 +218,7 @@ def _public_overflow(exc: "_RecurrenceOverflow", noun: str) -> "ICalTooLarge":
 
 
 def _expand(start, end, rrule_line: str | None, exdate_lines: list[str],
-            *, max_occ: int = 400, horizon_days: int = 400) -> list:
+            *, max_occ: int = 400, horizon_days: int = 400, truncate: bool = False) -> list:
     """Expand a recurring VEVENT (RRULE) into concrete (start, end) occurrences via python-dateutil — bounded to
     `max_occ`/`horizon_days` so an unbounded 'every Monday forever' can't blow up. Works for date OR datetime
     start/end. ANY parse issue → the single master occurrence, so a rule we don't model never under-blocks."""
@@ -237,14 +237,28 @@ def _expand(start, end, rrule_line: str | None, exdate_lines: list[str],
         # Anchor to NOW, not DTSTART: an established recurrence has a DTSTART years in the past, so a
         # DTSTART-anchored horizon would expand only historical occurrences and leave live dates unblocked.
         now = datetime.now(s_dt.tzinfo) if s_dt.tzinfo else datetime.now()   # noqa: DTZ005
-        window = rule.between(now - timedelta(days=2), now + timedelta(days=horizon_days), inc=True)
-        # Take ONE more than the cap so excess is DETECTED rather than sliced away. The old code
-        # did `[:max_occ]` here and the overflow check lived in the caller, counting what came
-        # back — so it could never see what this line discarded. A dropped busy period reads as
-        # FREE to an availability caller, which is the double-booking the overflow check exists
-        # to prevent, arriving by the one path that check did not cover. [astra 3, 2026-09-10]
-        if len(window) > max_occ:
-            raise _RecurrenceOverflow(rrule_line, len(window), max_occ)
+        # ITERATE, don't materialise. `rule.between(...)` builds the entire occurrence list before
+        # returning, so the cap was applied to a list that had already been paid for: a measured
+        # 100,000 datetimes for FREQ=SECONDLY;COUNT=100000, and 34,473,601 over 76 SECONDS for a
+        # one-line FREQ=SECONDLY with no COUNT — to enforce a limit of 400. A cap that costs 34
+        # million objects to apply is not a cap, it is a denial-of-service with a tidy error
+        # message. Stop at the (max_occ + 1)th occurrence inside the window: one past the cap is
+        # exactly enough to know we are over it, and nothing beyond that is ever generated.
+        # [astra 4, 2026-09-10]
+        lo = now - timedelta(days=2)
+        hi = now + timedelta(days=horizon_days)
+        window = []
+        for occ in rule:                                    # lazy: dateutil yields in order
+            if occ < lo:
+                continue
+            if occ > hi:
+                break                                       # past the horizon — no more can qualify
+            window.append(occ)
+            if len(window) > max_occ:                        # one past the cap: refuse, generate no more
+                if truncate:                                 # explicit escape hatch: stop here,
+                    window.pop()                             # keep exactly max_occ, expand ONCE
+                    break
+                raise _RecurrenceOverflow(rrule_line, len(window), max_occ)
         return [(occ.date(), (occ + dur).date()) if is_date else (occ, occ + dur) for occ in window]
         # empty = no current/future occurrences → block nothing (an expired/EXDATE'd rule must not re-block its master)
     except _RecurrenceOverflow:
@@ -282,7 +296,7 @@ def parse_ical_slots(text: str, *, max_events: int = 2000,
                         _occ = _expand(start, end, rrule, exdates)
                     except _RecurrenceOverflow as exc:
                         if on_overflow == "truncate":
-                            _occ = _expand(start, end, rrule, exdates, max_occ=10 ** 9)[:max_events]
+                            _occ = _expand(start, end, rrule, exdates, max_occ=max_events, truncate=True)
                         else:
                             raise _public_overflow(exc, "slot") from None
                     for os_, oe_ in _occ:

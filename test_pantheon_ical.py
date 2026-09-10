@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+import time
+
 import pytest
 
 from pantheon_ical import ICalTooLarge, build_ical, parse_ical, parse_ical_slots
@@ -227,3 +229,102 @@ class TestTheLimitIsTheLimitNotOneBelowIt:
         # the off-by-one fix must not become "no limit at all"
         with pytest.raises(ICalTooLarge):
             parse_ical_slots(_hourly_calendar(3), max_events=2)
+
+
+# ── the cap must PREVENT the work, not merely detect it [astra 4, 2026-09-10] ────────────────────
+# The 0.3.0 fix stopped silent data loss: an overflowing recurrence refuses instead of clipping.
+# It did not bound the COST of reaching that refusal. rule.between() materialises the whole
+# occurrence list first, so the cap was applied to a list that had already been built.
+#
+# Measured before fixing:
+#   FREQ=SECONDLY;COUNT=100000   ->   100,000 occurrences built, then refused   (0.23s)
+#   FREQ=SECONDLY  (no COUNT)    -> 34,473,601 occurrences built, then refused  (76.3s)
+#
+# A 400-occurrence cap that costs 34 million datetimes to enforce is not a cap. This is the same
+# resource-exhaustion shape as the tool-sanitizer finding — bound the work BEFORE doing it — and
+# the same lesson as the counted-not-caught bug: enforce the limit where the work happens.
+
+def _rule_cal(rule: str) -> str:
+    start = datetime.now(timezone.utc) + timedelta(days=1)
+    return ("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:rec-1\n"
+            f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}\n"
+            f"DTEND:{(start + timedelta(minutes=30)).strftime('%Y%m%dT%H%M%SZ')}\n"
+            f"{rule}\nEND:VEVENT\nEND:VCALENDAR\n")
+
+
+class TestTheCapBoundsTheWorkNotJustTheResult:
+
+    def _materialised(self, monkeypatch) -> dict:
+        """Count how many occurrences dateutil actually generates."""
+        from dateutil import rrule as _rr
+        seen = {"n": 0}
+        orig = _rr.rruleset._iter
+
+        def counting_iter(self):
+            for x in orig(self):
+                seen["n"] += 1
+                yield x
+
+        monkeypatch.setattr(_rr.rruleset, "_iter", counting_iter)
+        return seen
+
+    def test_a_bounded_hostile_rule_does_not_materialise_everything(self, monkeypatch):
+        seen = self._materialised(monkeypatch)
+        with pytest.raises(ICalTooLarge):
+            parse_ical_slots(_rule_cal("RRULE:FREQ=SECONDLY;COUNT=100000"))
+        assert seen["n"] < 1000, (
+            f"generated {seen['n']} occurrences to enforce a 400 cap — the cap must stop the "
+            "iteration, not filter its result")
+
+    def test_an_unbounded_hostile_rule_is_refused_quickly(self):
+        # FREQ=SECONDLY with no COUNT: 34.5 MILLION occurrences and 76s before this fix.
+        t0 = time.perf_counter()
+        with pytest.raises(ICalTooLarge):
+            parse_ical_slots(_rule_cal("RRULE:FREQ=SECONDLY"))
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 0.5, f"took {elapsed:.2f}s to refuse one recurring rule"
+
+    def test_iteration_stops_at_the_horizon_not_just_the_cap(self, monkeypatch):
+        """Mutation found this gap twice.
+
+        Turning the horizon `break` into `continue` still passed: the occurrence CAP eventually
+        fires anyway, so every hostile rule was still refused — just after grinding through the
+        occurrences one at a time (suite 0.09s -> 1.42s).
+
+        My first attempt to separate them used a rule with UNTIL in the past, which dateutil ends
+        by itself — so it proved nothing either. The case that ACTUALLY separates the two exits is
+        a rule starting BEYOND the horizon: nothing is ever collected, so the cap can never fire,
+        and only the horizon break can stop the iteration. Measured: 1 occurrence yielded with the
+        break, 100,000 without it.
+        """
+        seen = self._materialised(monkeypatch)
+        start = datetime.now(timezone.utc) + timedelta(days=3650)
+        future = ("BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:future\n"
+                  f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}\n"
+                  f"DTEND:{(start + timedelta(minutes=30)).strftime('%Y%m%dT%H%M%SZ')}\n"
+                  "RRULE:FREQ=SECONDLY;COUNT=100000\nEND:VEVENT\nEND:VCALENDAR\n")
+        out = parse_ical_slots(future)
+        assert out == [], "a rule entirely beyond the horizon blocks nothing"
+        assert seen["n"] < 100, (
+            f"yielded {seen['n']} occurrences for a rule that collects none — the iteration must "
+            "stop at the horizon, not grind to the occurrence cap")
+
+    def test_truncate_does_not_expand_a_second_time(self, monkeypatch):
+        """The explicit escape hatch re-expanded with max_occ=10**9 — a deliberate unbounded
+        expansion, added by the very fix that bounded the default path."""
+        seen = self._materialised(monkeypatch)
+        out = parse_ical_slots(_rule_cal("RRULE:FREQ=SECONDLY;COUNT=100000"),
+                               max_events=50, on_overflow="truncate")
+        assert len(out) == 50
+        assert seen["n"] < 1000, (
+            f"truncate generated {seen['n']} occurrences to return 50")
+
+    def test_a_legitimate_recurrence_is_unaffected(self):
+        assert len(parse_ical_slots(_rule_cal("RRULE:FREQ=HOURLY;COUNT=50"))) == 50
+
+    def test_the_boundary_occurrence_count_is_exact(self):
+        # cap is 400: 400 must pass, 401 must refuse. Bounded iteration makes off-by-one easy.
+        assert len(parse_ical_slots(_rule_cal("RRULE:FREQ=MINUTELY;COUNT=400"),
+                                    max_events=5000)) == 400
+        with pytest.raises(ICalTooLarge):
+            parse_ical_slots(_rule_cal("RRULE:FREQ=MINUTELY;COUNT=401"), max_events=5000)
